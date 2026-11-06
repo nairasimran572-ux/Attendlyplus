@@ -9,14 +9,15 @@ let qrScanner = null;
 let faceStream = null;
 let faceLoop = null;
 let pendingStudent = null;
+let pendingEnrollment = null;
 let modelsReady = false;
 let toastTimer;
 
 const $ = (id) => document.getElementById(id);
-const today = () => new Date().toLocaleDateString("en-CA");
+const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const timeNow = () => new Date().toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
-function loadState(){try{return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {students:[],records:[]}}catch{return {students:[],records:[]}}}
-function saveState(){localStorage.setItem(STORAGE_KEY,JSON.stringify(state));renderAll()}
+function loadState(){try{const saved=JSON.parse(localStorage.getItem(STORAGE_KEY));return {students:Array.isArray(saved?.students)?saved.students:[],records:Array.isArray(saved?.records)?saved.records:[]}}catch{return {students:[],records:[]}}}
+function saveState(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(state));renderAll();return true}catch(e){console.error("Could not save attendance data:",e);toast("Storage is full or unavailable. Export your records and try again.");return false}}
 function escapeHtml(v){return String(v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function toast(msg){const el=$("toast");el.textContent=msg;el.classList.add("show");clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove("show"),2600)}
 function initials(name){return name.split(/\s+/).slice(0,2).map(x=>x[0]).join("").toUpperCase()}
@@ -47,7 +48,7 @@ function openStudentDialog(student){$("studentForm").reset();$("editStudentId").
 function showQr(student){$("qrStudentName").textContent=student.name;$("qrStudentInfo").textContent=`${student.studentCode} · ${student.className}`;$("qrCode").innerHTML="";new QRCode($("qrCode"),{text:JSON.stringify({app:"AttendSmart",studentId:student.id,code:student.studentCode}),width:190,height:190,colorDark:"#192238",colorLight:"#ffffff",correctLevel:QRCode.CorrectLevel.H});$("qrDialog").showModal()}
 async function loadFaceModels(){if(!window.faceapi){$("modelStatus").textContent="Face recognition library unavailable. Check internet connection.";return false}try{$("modelStatus").textContent="Loading face recognition models…";await Promise.all([faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL)]);modelsReady=true;$("modelStatus").textContent="Face recognition models: ready";return true}catch(e){$("modelStatus").textContent="Could not load face models. Check internet and reload.";console.error(e);return false}}
 async function captureDescriptor(video){if(!modelsReady)throw new Error("Face models are not ready. Check internet and wait for loading.");const result=await faceapi.detectSingleFace(video,new faceapi.TinyFaceDetectorOptions({inputSize:320,scoreThreshold:.5})).withFaceLandmarks().withFaceDescriptor();if(!result)throw new Error("No clear face detected. Face the camera in good lighting.");return Array.from(result.descriptor)}
-async function enrollFace(student){if(!faceStream){toast("Start the camera first from Smart scanner.");navigate("scanner");return}try{const descriptor=await captureDescriptor($("faceVideo"));student.descriptor=descriptor;saveState();toast(`Face enrolled for ${student.name}`)}catch(e){toast(e.message)}}
+async function enrollFace(student){if(!faceStream){toast("Start the camera first from Smart scanner.");navigate("scanner");return}try{const descriptor=await captureDescriptor($("faceVideo"));student.descriptor=descriptor;saveState();pendingEnrollment=null;$("captureFaceBtn").disabled=true;toast(`Face enrolled for ${student.name}`)}catch(e){toast(e.message)}}
 function distance(a,b){let sum=0;for(let i=0;i<a.length;i++)sum+=(a[i]-b[i])**2;return Math.sqrt(sum)}
 async function recognizeFace(){const live=await captureDescriptor($("faceVideo"));const matches=state.students.filter(s=>Array.isArray(s.descriptor)).map(s=>({s,d:distance(live,s.descriptor)})).sort((a,b)=>a.d-b.d);if(!matches.length)throw new Error("No face profiles enrolled yet.");if(matches[0].d>.52)throw new Error("Face not recognized. Try again or use manual attendance.");return matches[0].s}
 function parseQr(text){try{const obj=JSON.parse(text);if(obj.app!=="AttendSmart"||!obj.studentId)throw 0;return state.students.find(s=>s.id===obj.studentId&&s.studentCode===obj.code)}catch{return null}}
@@ -64,24 +65,214 @@ async function startCamera(){if(!navigator.mediaDevices?.getUserMedia){setStatus
         $("faceVideo").srcObject=faceStream;await $("faceVideo").play();
       }
     }else{await startFaceVideo()}
-    $("stopCameraBtn").disabled=false;setStatus("Camera active. Ready to scan.","success");
-  }catch(e){console.error(e);$("cameraPlaceholder").classList.remove("hidden");$("startCameraBtn").disabled=false;setStatus("Unable to start camera. Allow camera permission and close other camera apps.","error")}
+    $("stopCameraBtn").disabled=false;$("captureFaceBtn").disabled=!(faceStream&&pendingEnrollment);setStatus("Camera active. Ready to scan.","success");
+  }catch(e){console.error(e);try{if(qrScanner?.isScanning)await qrScanner.stop()}catch{}if(faceStream){faceStream.getTracks().forEach(t=>t.stop());faceStream=null}$("faceVideo").srcObject=null;$("cameraPlaceholder").classList.remove("hidden");$("startCameraBtn").disabled=false;$("stopCameraBtn").disabled=true;$("captureFaceBtn").disabled=true;setStatus("Unable to start camera. Allow camera permission and close other camera apps.","error")}
 }
-async function startFaceVideo(){faceStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}},audio:false});$("faceVideo").srcObject=faceStream;$("faceVideo").style.display="block";$("qrReader").style.display="none";await $("faceVideo").play();faceLoop=setInterval(async()=>{if(!faceStream||currentMode!=="face")return;try{const s=await recognizeFace();markPresent(s,"Face recognition");}catch(e){if(!e.message.includes("No clear face"))setStatus(e.message,"error")}},1800)}
-async function stopCamera(){if(qrScanner){try{if(qrScanner.isScanning)await qrScanner.stop()}catch{} }if(faceLoop){clearInterval(faceLoop);faceLoop=null}if(faceStream){faceStream.getTracks().forEach(t=>t.stop());faceStream=null}$("faceVideo").srcObject=null;$("faceVideo").style.display="none";$("qrReader").style.display="none";$("cameraPlaceholder").classList.remove("hidden");$("startCameraBtn").disabled=false;$("stopCameraBtn").disabled=true;setStatus("Camera stopped.");}
+async function startFaceVideo(){faceStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}},audio:false});$("faceVideo").srcObject=faceStream;$("faceVideo").style.display="block";$("qrReader").style.display="none";await $("faceVideo").play();faceLoop=setInterval(async()=>{if(!faceStream||currentMode!=="face"||pendingEnrollment)return;try{const s=await recognizeFace();markPresent(s,"Face recognition");}catch(e){if(!e.message.includes("No clear face"))setStatus(e.message,"error")}},1800)}
+async function stopCamera(){if(qrScanner){try{if(qrScanner.isScanning)await qrScanner.stop()}catch{} }if(faceLoop){clearInterval(faceLoop);faceLoop=null}if(faceStream){faceStream.getTracks().forEach(t=>t.stop());faceStream=null}$("faceVideo").srcObject=null;$("faceVideo").style.display="none";$("qrReader").style.display="none";$("cameraPlaceholder").classList.remove("hidden");$("startCameraBtn").disabled=false;$("stopCameraBtn").disabled=true;$("captureFaceBtn").disabled=true;setStatus("Camera stopped.");}
 async function verifyPendingFace(){if(!pendingStudent){setStatus("Scan a QR code first.","error");return}try{const found=await recognizeFace();if(found.id!==pendingStudent.id){setStatus(`Face mismatch. QR belongs to ${pendingStudent.name}, but another student was recognized.`,"error");return}markPresent(found,"QR + Face")}catch(e){setStatus(e.message,"error")}}
 function exportCsv(){const rows=[["Student Name","Student ID","Class","Date","Time","Method","Status"]];state.records.forEach(r=>{const s=state.students.find(x=>x.id===r.studentId);if(s)rows.push([s.name,s.studentCode,s.className,r.date,r.time,r.method,r.status])});const csv=rows.map(row=>row.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(",")).join("\r\n");const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download="attendsmart-attendance.csv";a.click();URL.revokeObjectURL(a.href)}
 function init(){ $("todayLabel").textContent=new Date().toLocaleDateString(undefined,{weekday:"short",day:"numeric",month:"short",year:"numeric"});$("recordDate").value=today();renderAll();
   document.querySelectorAll(".nav-link").forEach(b=>b.addEventListener("click",()=>navigate(b.dataset.view)));document.querySelectorAll("[data-go]").forEach(b=>b.addEventListener("click",()=>navigate(b.dataset.go)));$("quickScanBtn").onclick=()=>navigate("scanner");
-  $("addStudentBtn").onclick=()=>openStudentDialog();$("closeDialog").onclick=$("cancelDialog").onclick=()=>$("studentDialog").close();$("studentSearch").addEventListener("input",renderStudents);
-  $("studentForm").addEventListener("submit",e=>{e.preventDefault();const edit=$("editStudentId").value,name=$("studentName").value.trim(),code=$("studentId").value.trim(),cls=$("studentClass").value.trim();if(!name||!code||!cls)return;const duplicate=state.students.some(s=>s.studentCode.toLowerCase()===code.toLowerCase()&&s.id!==edit);if(duplicate){toast("Student ID already exists.");return}if(edit){const s=state.students.find(x=>x.id===edit);Object.assign(s,{name,className:cls})}else state.students.push({id:crypto.randomUUID(),name,studentCode:code,className:cls,descriptor:null});saveState();$("studentDialog").close();toast("Student saved successfully")});
-  $("studentsTable").addEventListener("click",e=>{const b=e.target.closest("[data-action]");if(!b)return;const s=state.students.find(x=>x.id===b.dataset.id);if(!s)return;if(b.dataset.action==="qr")showQr(s);if(b.dataset.action==="face"){navigate("scanner");if(!modelsReady)toast("Wait for face models to load, then start camera.");else enrollFace(s)}if(b.dataset.action==="delete"&&confirm(`Delete ${s.name} and their attendance records?`)){state.students=state.students.filter(x=>x.id!==s.id);state.records=state.records.filter(r=>r.studentId!==s.id);saveState();toast("Student deleted")}});
+  
+$("markAbsentBtn").onclick = async () => {
+
+    const date = $("recordDate").value || today();
+
+    const newlyAbsent = [];
+
+    state.students.forEach(student => {
+
+        const existing = attendanceFor(student.id, date);
+
+        if (!existing) {
+
+            state.records.push({
+                studentId: student.id,
+                date,
+                time: "—",
+                method: "Not checked in",
+                status: "Absent"
+            });
+
+            newlyAbsent.push(student);
+        }
+    });
+
+    saveState();
+
+    toast("Remaining students marked absent");
+
+    for (const student of newlyAbsent) {
+        await sendAbsentNotification(student, date);
+    }
+
+};
+openStudentDialog();$("closeDialog").onclick=$("cancelDialog").onclick=()=>$("studentDialog").close();$("studentSearch").addEventListener("input",renderStudents);
+  
+$("recordsTable").addEventListener("click", async (e) => {
+
+    const b = e.target.closest("[data-action]");
+    if (!b) return;
+
+    const s = state.students.find(
+        x => x.id === b.dataset.id
+    );
+
+    if (!s) return;
+
+    const date = $("recordDate").value || today();
+
+    let r = attendanceFor(s.id, date);
+
+    if (b.dataset.action === "present") {
+
+        if (r) {
+            Object.assign(r, {
+                status: "Present",
+                time: timeNow(),
+                method: "Manual"
+            });
+        } else {
+            state.records.push({
+                studentId: s.id,
+                date,
+                time: timeNow(),
+                method: "Manual",
+                status: "Present"
+            });
+        }
+
+        saveState();
+        toast("Student marked present");
+
+    } else if (b.dataset.action === "absent") {
+
+        const alreadyAbsent = r?.status === "Absent";
+
+        if (!r) {
+            r = {
+                studentId: s.id,
+                date,
+                time: "—",
+                method: "Manual",
+                status: "Absent"
+            };
+
+            state.records.push(r);
+
+        } else {
+            r.status = "Absent";
+            r.method = "Manual";
+        }
+
+        saveState();
+
+        if (!alreadyAbsent) {
+            await sendAbsentNotification(s, date);
+        }
+
+        toast("Student marked absent");
+    }
+
+});
+e.preventDefault();const edit=$("editStudentId").value,name=$("studentName").value.trim(),code=$("studentId").value.trim(),cls=$("studentClass").value.trim();if(!name||!code||!cls)return;const duplicate=state.students.some(s=>s.studentCode.toLowerCase()===code.toLowerCase()&&s.id!==edit);if(duplicate){toast("Student ID already exists.");return}if(edit){const s=state.students.find(x=>x.id===edit);Object.assign(s,{name,className:cls})}else state.students.push({
+    id: crypto.randomUUID(),
+    name,
+    studentCode: code,
+    className: cls,
+    descriptor: null,
+    parentEmail: "",
+    parentUid: ""
+});saveState();$("studentDialog").close();toast("Student saved successfully")});
+  $("studentsTable").addEventListener("click", e => {
+    const b = e.target.closest("[data-action]");
+    if (!b) return;
+
+    const s = state.students.find(x => x.id === b.dataset.id);
+    if (!s) return;
+
+    if (b.dataset.action === "qr") {
+        showQr(s);
+    }
+
+    if (b.dataset.action === "face") {
+        pendingEnrollment = s;
+        currentMode = "face";
+        document.querySelectorAll(".mode-card").forEach(x => x.classList.toggle("selected", x.dataset.mode === "face"));
+        $("captureFaceBtn").disabled = true;
+        navigate("scanner");
+
+        if (!modelsReady) {
+            toast("Wait for face models to load.");
+        } else {
+            toast("Student selected. Start camera and capture face.");
+        }
+    }
+
+    if (b.dataset.action === "delete" &&
+        confirm(`Delete ${s.name} and their attendance records?`)) {
+
+        state.students = state.students.filter(x => x.id !== s.id);
+        state.records = state.records.filter(r => r.studentId !== s.id);
+
+        saveState();
+        toast("Student deleted");
+    }
+});
   $("closeQrDialog").onclick=()=>$("qrDialog").close();$("printQrBtn").onclick=()=>window.print();$("recordDate").onchange=renderRecords;$("recordFilter").onchange=renderRecords;
-  $("recordsTable").addEventListener("click",e=>{const b=e.target.closest("[data-action]");if(!b)return;const s=state.students.find(x=>x.id===b.dataset.id);if(!s)return;const date=$("recordDate").value||today();let r=state.records.find(x=>x.studentId===s.id&&x.date===date);if(b.dataset.action==="present"){if(r)Object.assign(r,{status:"Present",time:timeNow(),method:"Manual"});else state.records.push({studentId:s.id,date,time:timeNow(),method:"Manual",status:"Present"})}else if(r)r.status="Absent";saveState()});
-  $("markAbsentBtn").onclick=()=>{const date=$("recordDate").value||today();state.students.forEach(s=>{if(!attendanceFor(s.id,date))state.records.push({studentId:s.id,date,time:"—",method:"Not checked in",status:"Absent"})});saveState();toast("Remaining students marked absent")};
-  $("exportCsvBtn").onclick=exportCsv;$("startCameraBtn").onclick=startCamera;$("stopCameraBtn").onclick=stopCamera;$("verifyFaceBtn").onclick=verifyPendingFace;
+  $("exportCsvBtn").onclick = exportCsv;
+$("startCameraBtn").onclick = startCamera;
+$("stopCameraBtn").onclick = stopCamera;
+$("verifyFaceBtn").onclick = verifyPendingFace;
+
+// Capture face button
+$("captureFaceBtn").onclick = async () => {
+    if (!pendingEnrollment) {
+        toast("Select a student using Enroll Face first.");
+        return;
+    }
+
+    if (!faceStream) {
+        toast("Start the camera first.");
+        return;
+    }
+
+    $("captureFaceBtn").disabled = true;
+    await enrollFace(pendingEnrollment);
+    $("captureFaceBtn").disabled = !(faceStream && pendingEnrollment);
+};
   document.querySelectorAll(".mode-card").forEach(b=>b.onclick=async()=>{if(faceStream||qrScanner?.isScanning)await stopCamera();currentMode=b.dataset.mode;document.querySelectorAll(".mode-card").forEach(x=>x.classList.toggle("selected",x===b));pendingStudent=null;$("pendingVerify").classList.add("hidden");setStatus("Mode changed. Start the camera to continue.")});
   loadFaceModels();
 }
-document.addEventListener("DOMContentLoaded",init);
-window.addEventListener("beforeunload",()=>{if(faceStream)faceStream.getTracks().forEach(t=>t.stop())});
+document.addEventListener("DOMContentLoaded", init);
+
+window.addEventListener("beforeunload", () => {
+  if (faceStream) faceStream.getTracks().forEach(t => t.stop());
+});
+
+// Allow index.html to call this function after scanning an uploaded QR image
+window.onQrDecoded = onQrDecoded;
+async function sendAbsentNotification(student, date) {
+    if (typeof window.notifyParentAbsent !== "function") {
+        console.error("Firebase notification function is unavailable.");
+        toast("Attendance saved. Notification system unavailable.");
+        return;
+    }
+
+    try {
+        const result = await window.notifyParentAbsent(
+            student.id,
+            student.name,
+            date
+        );
+
+        if (result?.success) {
+            console.log("Parent notification sent:", student.name);
+        } else {
+            console.warn("Parent notification not confirmed:", result);
+        }
+    } catch (error) {
+        console.error("Parent notification error:", error);
+    }
+}
